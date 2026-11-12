@@ -32,11 +32,11 @@ jobs:
 
       - name: 5. 预下载 SenseVoice 离线语音模型
         run: |
-          mkdir models
-          curl -L -o models/sensevoice.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+          New-Item -ItemType Directory -Force -Path "models"
+          curl.exe -L -o models/sensevoice.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
           tar -xjf models/sensevoice.tar.bz2 -C models/
-          mv models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/* models/
-          rm -rf models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17 models/sensevoice.tar.bz2
+          Move-Item -Path "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/*" -Destination "models/" -Force
+          Remove-Item -Path "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17", "models/sensevoice.tar.bz2" -Recurse -Force
 
       - name: 6. 打包即开即用绿色版目录
         env:
@@ -53,9 +53,9 @@ jobs:
 
       - name: 7. 生成可下载的绿色完整版压缩包
         run: |
-          mkdir release_pkg
-          xcopy /E /I /Y "dist\文案与媒体全能提取工作台" "release_pkg\文案与媒体全能提取工作台"
-          powershell Compress-Archive -Path "release_pkg\文案与媒体全能提取工作台" -DestinationPath "OfflineCopyExtractor-Win-Full-Portable.zip" -Force
+          New-Item -ItemType Directory -Force -Path "release_pkg"
+          Copy-Item -Path "dist\文案与媒体全能提取工作台" -Destination "release_pkg\文案与媒体全能提取工作台" -Recurse -Force
+          Compress-Archive -Path "release_pkg\文案与媒体全能提取工作台" -DestinationPath "OfflineCopyExtractor-Win-Full-Portable.zip" -Force
 
       - name: 8. 上传完整安装包
         uses: actions/upload-artifact@v4
