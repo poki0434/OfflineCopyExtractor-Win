@@ -1,0 +1,1 @@
+# OfflineCopyExtractor-Win
