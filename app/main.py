@@ -8,41 +8,82 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QPushButton, QLabel, QTextEdit, QListWidget, QListWidgetItem,
-    QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu
+    QPushButton, QLabel, QPlainTextEdit, QListWidget, QListWidgetItem,
+    QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QStackedWidget
 )
 
 from database import HistoryManager
 from asr_ocr_engine import LocalAiEngine
 from media_sniffer import MediaSniffer
 
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".wmv", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+class PlainTextInput(QPlainTextEdit):
+    def insertFromMimeData(self, source):
+        if source.hasText():
+            self.insertPlainText(source.text())
+        else:
+            super().insertFromMimeData(source)
+
 
 class WorkerThread(QThread):
     finished_signal = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
+    show_browser_signal = pyqtSignal()
+    hide_browser_signal = pyqtSignal()
 
-    def __init__(self, task_type: str, payload, ai_engine: LocalAiEngine, sniffer: MediaSniffer):
+    def __init__(self, task_type: str, payload, ai_engine: LocalAiEngine, sniffer: MediaSniffer, host_info_fn=None):
         super().__init__()
         self.task_type = task_type
         self.payload = payload
         self.ai = ai_engine
         self.sniffer = sniffer
+        self.host_info_fn = host_info_fn
 
     def run(self):
         try:
-            if self.task_type == "video_link":
-                res = self.sniffer.sniff_and_download_video(self.payload, show_browser=True)
+            if self.task_type == "video_download_only":
+                res = self.sniffer.sniff_and_download_video(
+                    self.payload,
+                    host_info_fn=self.host_info_fn,
+                    on_embed_ready=self.show_browser_signal.emit,
+                    on_embed_closed=self.hide_browser_signal.emit
+                )
+                summary = f"【无水印原画视频已保存】\n视频标题：{res['title']}\n本地路径：{res['file_path']}"
+                self.finished_signal.emit({
+                    "mode": "video_link",
+                    "category": "无水印视频",
+                    "source": self.payload,
+                    "content": summary,
+                    "media_path": res["file_path"]
+                })
+            elif self.task_type == "video_link":
+                res = self.sniffer.sniff_and_download_video(
+                    self.payload,
+                    host_info_fn=self.host_info_fn,
+                    on_embed_ready=self.show_browser_signal.emit,
+                    on_embed_closed=self.hide_browser_signal.emit
+                )
                 text = self.ai.transcribe_media(res["file_path"])
                 self.finished_signal.emit({
+                    "mode": "video_link",
                     "category": "无水印视频",
                     "source": self.payload,
                     "content": text,
                     "media_path": res["file_path"]
                 })
             elif self.task_type == "music_link":
-                res = self.sniffer.sniff_and_download_music(self.payload, show_browser=True)
+                res = self.sniffer.sniff_and_download_music(
+                    self.payload,
+                    host_info_fn=self.host_info_fn,
+                    on_embed_ready=self.show_browser_signal.emit,
+                    on_embed_closed=self.hide_browser_signal.emit
+                )
                 summary = f"【已识别歌曲并自动重命名】\n歌曲文件名：{os.path.basename(res['file_path'])}\n保存位置：{res['file_path']}\n\n【网页歌词/页面信息摘录】\n{res['lyrics_preview']}"
                 self.finished_signal.emit({
+                    "mode": "music_link",
                     "category": "音乐下载",
                     "source": self.payload,
                     "content": summary,
@@ -51,6 +92,7 @@ class WorkerThread(QThread):
             elif self.task_type == "article_link":
                 text = self.ai.extract_article(self.payload)
                 self.finished_signal.emit({
+                    "mode": "article_link",
                     "category": "文章",
                     "source": self.payload,
                     "content": text,
@@ -64,6 +106,7 @@ class WorkerThread(QThread):
                     txt = self.ai.transcribe_media(fpath)
                     outputs.append(f"【文件：{fname}】\n{txt}")
                 self.finished_signal.emit({
+                    "mode": "local_media",
                     "category": "本地音视频",
                     "source": f"本地批量导入 ({len(files)} 个文件)：" + ", ".join([os.path.basename(x) for x in files]),
                     "content": "\n\n----------------------------------------\n\n".join(outputs),
@@ -77,12 +120,21 @@ class WorkerThread(QThread):
                     txt = self.ai.recognize_image(fpath)
                     outputs.append(f"【图片：{fname}】\n{txt}")
                 self.finished_signal.emit({
+                    "mode": "local_image",
                     "category": "图片",
                     "source": f"本地图片识别 ({len(files)} 张)：" + ", ".join([os.path.basename(x) for x in files]),
                     "content": "\n\n----------------------------------------\n\n".join(outputs),
                     "media_path": files[0] if len(files) == 1 else ""
                 })
+            elif self.task_type == "login_embed":
+                self.sniffer.open_login_window(
+                    self.payload,
+                    host_info_fn=self.host_info_fn,
+                    on_embed_ready=self.show_browser_signal.emit,
+                    on_embed_closed=self.hide_browser_signal.emit
+                )
         except Exception as e:
+            self.hide_browser_signal.emit()
             self.error_signal.emit(str(e))
 
 
@@ -157,15 +209,67 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("全能离线文案与媒体提取工作台（即开即用完整版）")
-        self.resize(1180, 740)
+        self.resize(1240, 760)
+        self.setAcceptDrops(True)
 
         self.db = HistoryManager("history.db")
         self.ai_engine = LocalAiEngine()
         self.sniffer = MediaSniffer("Downloads", "browser_profile")
         self.current_mode = "video_link"
-        self.current_filter = "全部"
-        self.current_record = None
         self.is_pinned = False
+
+        self.mode_configs = {
+            "video_link": {
+                "title": "链接转文字 & 无水印视频下载",
+                "placeholder": "粘贴抖音 / 快手 / 小红书分享口令或网页链接（自动清除富文本黑底格式）...",
+                "category": "无水印视频",
+                "input_text": "",
+                "meta": "识别时间：暂无记录",
+                "source": "",
+                "content": "",
+                "media_path": ""
+            },
+            "music_link": {
+                "title": "QQ音乐 & 网易云音乐嗅探下载（自动按歌名重命名）",
+                "placeholder": "粘贴 QQ音乐 或 网易云音乐单曲分享链接...",
+                "category": "音乐下载",
+                "input_text": "",
+                "meta": "识别时间：暂无记录",
+                "source": "",
+                "content": "",
+                "media_path": ""
+            },
+            "article_link": {
+                "title": "文章 / 公众号链接转文字",
+                "placeholder": "粘贴微信公众号或网页文章链接...",
+                "category": "文章",
+                "input_text": "",
+                "meta": "识别时间：暂无记录",
+                "source": "",
+                "content": "",
+                "media_path": ""
+            },
+            "local_media": {
+                "title": "本地音视频批量转文字（支持拖拽文件到窗口任意位置）",
+                "placeholder": "直接把本地视频/音频文件拖入窗口，或点击下方「选择文件并转写」...",
+                "category": "本地音视频",
+                "input_text": "",
+                "meta": "识别时间：暂无记录",
+                "source": "",
+                "content": "",
+                "media_path": ""
+            },
+            "local_image": {
+                "title": "图片 / 截图离线识字（支持拖拽图片到窗口任意位置）",
+                "placeholder": "直接把截图/图片拖入窗口，或点击下方「选择图片并识字」...",
+                "category": "图片",
+                "input_text": "",
+                "meta": "识别时间：暂无记录",
+                "source": "",
+                "content": "",
+                "media_path": ""
+            }
+        }
 
         self.floating_win = FloatingCapsule()
         self.floating_win.restore_requested.connect(self.restore_from_floating)
@@ -173,7 +277,7 @@ class MainWindow(QMainWindow):
 
         self._init_tray()
         self._init_ui()
-        self.refresh_history()
+        self.switch_mode("video_link")
 
     def _create_app_icon(self) -> QIcon:
         pix = QPixmap(64, 64)
@@ -215,30 +319,36 @@ class MainWindow(QMainWindow):
     def _init_ui(self):
         self.setStyleSheet('''
             QMainWindow { background-color: #F3F6FA; }
-            QLabel, QTextEdit, QListWidget { font-family: "Microsoft YaHei"; color: #0F172A; }
+            QLabel, QPlainTextEdit, QListWidget { font-family: "Microsoft YaHei"; color: #0F172A; }
             QPushButton { font-family: "Microsoft YaHei"; }
             QPushButton#NavBtn {
-                text-align: left; padding: 11px 14px; border-radius: 10px;
+                text-align: left; padding: 12px 14px; border-radius: 10px;
                 border: none; background: transparent; font-size: 13px; font-weight: bold; color: #334155;
             }
             QPushButton#NavBtn:hover { background-color: #F1F5F9; color: #0F172A; }
             QPushButton#NavBtn[active="true"] { background-color: #E6F4FF; color: #0958D9; }
             QPushButton#PrimaryBtn {
                 background-color: #1677FF; color: #FFFFFF; border: none; border-radius: 10px;
-                padding: 10px 18px; font-size: 14px; font-weight: bold;
+                padding: 10px 14px; font-size: 13px; font-weight: bold;
             }
             QPushButton#PrimaryBtn:hover { background-color: #0958D9; color: #FFFFFF; }
             QPushButton#PrimaryBtn:disabled { background-color: #94A3B8; color: #FFFFFF; }
+            QPushButton#GreenBtn {
+                background-color: #059669; color: #FFFFFF; border: none; border-radius: 10px;
+                padding: 10px 14px; font-size: 13px; font-weight: bold;
+            }
+            QPushButton#GreenBtn:hover { background-color: #047857; color: #FFFFFF; }
+            QPushButton#GreenBtn:disabled { background-color: #94A3B8; color: #FFFFFF; }
             QPushButton#SecondaryBtn {
                 background-color: #FFFFFF; color: #1E293B; border: 1px solid #CBD5E1;
                 border-radius: 9px; padding: 8px 12px; font-size: 12px; font-weight: bold;
             }
             QPushButton#SecondaryBtn:hover { background-color: #F8FAFC; border-color: #1677FF; color: #1677FF; }
-            QTextEdit {
+            QPlainTextEdit {
                 background-color: #F8FAFC; border: 1.5px solid #E2E8F0;
                 border-radius: 12px; padding: 10px; font-size: 13px; color: #0F172A;
             }
-            QTextEdit:focus { border-color: #1677FF; background-color: #FFFFFF; }
+            QPlainTextEdit:focus { border-color: #1677FF; background-color: #FFFFFF; }
         ''')
 
         central = QWidget()
@@ -254,7 +364,7 @@ class MainWindow(QMainWindow):
 
         lbl_brand = QLabel("全能离线文案与媒体提取工作台")
         lbl_brand.setStyleSheet("font-size: 15px; font-weight: bold; color: #0F172A;")
-        lbl_badge = QLabel(" 内置语音模型 + OCR模型 + 嗅探浏览器 · 即开即用 ")
+        lbl_badge = QLabel(" 元数据直链无水印嗅探 · 任意界面拖入文件 · 独立工作区 ")
         lbl_badge.setStyleSheet("background-color: #E0F2FE; color: #0284C7; border-radius: 8px; padding: 3px 8px; font-size: 11px; font-weight: bold;")
 
         self.btn_pin = QPushButton("📌 置顶窗口")
@@ -310,49 +420,52 @@ class MainWindow(QMainWindow):
             self.nav_buttons[key] = btn
 
         side_layout.addStretch()
-        lbl_tip = QLabel("保存目录：./Downloads/\n历史数据库：./history.db\n支持多选文件批量队列转写")
-        lbl_tip.setStyleSheet("background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 10px; padding: 10px; font-size: 11px; color: #475569;")
+        lbl_tip = QLabel("💡 效率提示：\n将音视频或图片拖入软件任意位置，会自动跳转到对应功能并立即开始提取！")
+        lbl_tip.setWordWrap(True)
+        lbl_tip.setStyleSheet("background-color: #F0F9FF; border: 1px solid #BAE6FD; border-radius: 10px; padding: 10px; font-size: 11px; color: #0369A1;")
         side_layout.addWidget(lbl_tip)
         body_layout.addWidget(sidebar)
 
         center_panel = QFrame()
-        center_panel.setFixedWidth(420)
+        center_panel.setFixedWidth(430)
         center_panel.setStyleSheet("background-color: #F8FAFC; border-right: 1px solid #E2E8F0;")
         center_layout = QVBoxLayout(center_panel)
         center_layout.setContentsMargins(16, 16, 16, 16)
-        center_layout.setSpacing(12)
+        center_layout.setSpacing(10)
 
-        self.lbl_mode_title = QLabel("链接转文字 & 无水印视频保存")
+        self.lbl_mode_title = QLabel("链接转文字 & 无水印视频下载")
         self.lbl_mode_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #0F172A;")
         center_layout.addWidget(self.lbl_mode_title)
 
-        self.input_edit = QTextEdit()
-        self.input_edit.setFixedHeight(92)
-        self.input_edit.setPlaceholderText("粘贴抖音 / 快手 / 小红书分享口令或网页链接，自动弹出小窗识别无水印视频并离线转写文案...")
+        self.input_edit = PlainTextInput()
+        self.input_edit.setFixedHeight(90)
         center_layout.addWidget(self.input_edit)
 
         btn_row = QHBoxLayout()
-        self.btn_run = QPushButton("⚡ 立即提取")
+        btn_row.setSpacing(8)
+
+        self.btn_run = QPushButton("⚡ 提取文案 + 视频")
         self.btn_run.setObjectName("PrimaryBtn")
-        self.btn_run.setStyleSheet("background-color: #1677FF; color: #FFFFFF; border: none; border-radius: 10px; padding: 10px 16px; font-size: 14px; font-weight: bold;")
-        self.btn_run.clicked.connect(self.start_extract)
+        self.btn_run.setStyleSheet("background-color: #1677FF; color: #FFFFFF; border: none; border-radius: 10px; padding: 10px 12px; font-size: 13px; font-weight: bold;")
+        self.btn_run.clicked.connect(lambda: self.start_extract(download_only=False))
 
-        btn_browser = QPushButton("🌐 小窗登录/过验证")
-        btn_browser.setObjectName("SecondaryBtn")
-        btn_browser.clicked.connect(self.open_login_browser)
+        self.btn_download_only = QPushButton("🎬 仅去水印下载")
+        self.btn_download_only.setObjectName("GreenBtn")
+        self.btn_download_only.setStyleSheet("background-color: #059669; color: #FFFFFF; border: none; border-radius: 10px; padding: 10px 12px; font-size: 13px; font-weight: bold;")
+        self.btn_download_only.clicked.connect(lambda: self.start_extract(download_only=True))
 
-        btn_row.addWidget(self.btn_run, 2)
-        btn_row.addWidget(btn_browser, 1)
+        self.btn_browser = QPushButton("🌐 内嵌登录")
+        self.btn_browser.setObjectName("SecondaryBtn")
+        self.btn_browser.clicked.connect(self.open_login_browser)
+
+        btn_row.addWidget(self.btn_run, 3)
+        btn_row.addWidget(self.btn_download_only, 3)
+        btn_row.addWidget(self.btn_browser, 2)
         center_layout.addLayout(btn_row)
 
-        filter_row = QHBoxLayout()
-        filter_row.setSpacing(4)
-        for cat in ["全部", "无水印视频", "音乐下载", "本地音视频", "文章", "图片"]:
-            b = QPushButton(cat)
-            b.setStyleSheet("padding: 5px 8px; border-radius: 8px; font-size: 11px; font-weight: bold; background-color: #E2E8F0; color: #1E293B; border: none;")
-            b.clicked.connect(lambda _, c=cat: self.set_filter(c))
-            filter_row.addWidget(b)
-        center_layout.addLayout(filter_row)
+        lbl_hist_hdr = QLabel("当前功能历史记录")
+        lbl_hist_hdr.setStyleSheet("font-size: 12px; font-weight: bold; color: #475569; margin-top: 4px;")
+        center_layout.addWidget(lbl_hist_hdr)
 
         self.history_list = QListWidget()
         self.history_list.setStyleSheet('''
@@ -367,9 +480,11 @@ class MainWindow(QMainWindow):
         center_layout.addWidget(self.history_list)
         body_layout.addWidget(center_panel)
 
-        right_panel = QFrame()
-        right_panel.setStyleSheet("background-color: #FFFFFF;")
-        right_layout = QVBoxLayout(right_panel)
+        self.right_stack = QStackedWidget()
+        self.right_stack.setStyleSheet("background-color: #FFFFFF;")
+
+        result_page = QWidget()
+        right_layout = QVBoxLayout(result_page)
         right_layout.setContentsMargins(20, 16, 20, 16)
         right_layout.setSpacing(12)
 
@@ -386,7 +501,7 @@ class MainWindow(QMainWindow):
         lbl_src_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #1677FF;")
         right_layout.addWidget(lbl_src_title)
 
-        self.detail_source = QTextEdit()
+        self.detail_source = PlainTextInput()
         self.detail_source.setReadOnly(True)
         self.detail_source.setFixedHeight(64)
         right_layout.addWidget(self.detail_source)
@@ -395,7 +510,7 @@ class MainWindow(QMainWindow):
         lbl_cnt_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #1677FF;")
         right_layout.addWidget(lbl_cnt_title)
 
-        self.detail_content = QTextEdit()
+        self.detail_content = PlainTextInput()
         right_layout.addWidget(self.detail_content)
 
         bottom_bar = QHBoxLayout()
@@ -428,8 +543,62 @@ class MainWindow(QMainWindow):
         bottom_bar.addWidget(btn_copy_all)
         right_layout.addLayout(bottom_bar)
 
-        body_layout.addWidget(right_panel, 1)
+        browser_page = QWidget()
+        b_layout = QVBoxLayout(browser_page)
+        b_layout.setContentsMargins(12, 10, 12, 12)
+        b_layout.setSpacing(8)
+
+        b_banner = QFrame()
+        b_banner.setStyleSheet("background-color: #EFF6FF; border: 1px solid #BFDBFE; border-radius: 8px;")
+        bb_layout = QHBoxLayout(b_banner)
+        bb_layout.setContentsMargins(12, 6, 12, 6)
+        lbl_b_tip = QLabel("🌐 内置浏览器正在解析无水印原始流（如遇登录或滑块验证，请直接在下方画面操作，捕获后自动下载并切回结果）")
+        lbl_b_tip.setStyleSheet("font-size: 12px; font-weight: bold; color: #1D4ED8; border: none;")
+        bb_layout.addWidget(lbl_b_tip)
+        b_layout.addWidget(b_banner)
+
+        self.browser_host = QFrame()
+        self.browser_host.setStyleSheet("background-color: #0F172A; border-radius: 10px;")
+        b_layout.addWidget(self.browser_host, 1)
+
+        self.right_stack.addWidget(result_page)
+        self.right_stack.addWidget(browser_page)
+
+        body_layout.addWidget(self.right_stack, 1)
         root_layout.addLayout(body_layout, 1)
+
+    def get_browser_host_info(self):
+        return int(self.browser_host.winId()), max(500, self.browser_host.width()), max(400, self.browser_host.height())
+
+    def show_embedded_browser(self):
+        self.right_stack.setCurrentIndex(1)
+
+    def hide_embedded_browser(self):
+        self.right_stack.setCurrentIndex(0)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        local_files = [u.toLocalFile() for u in urls if os.path.isfile(u.toLocalFile())]
+        if not local_files:
+            return
+
+        media_files = [f for f in local_files if os.path.splitext(f)[1].lower() in VIDEO_EXTS]
+        image_files = [f for f in local_files if os.path.splitext(f)[1].lower() in IMAGE_EXTS]
+
+        if media_files:
+            self.switch_mode("local_media")
+            self._run_worker("local_media", media_files)
+        elif image_files:
+            self.switch_mode("local_image")
+            self._run_worker("local_image", image_files)
+        else:
+            QMessageBox.information(self, "文件格式提示", "暂不支持该文件格式，请拖入常见的音视频或图片文件。")
 
     def toggle_pin(self):
         self.is_pinned = not self.is_pinned
@@ -461,60 +630,111 @@ class MainWindow(QMainWindow):
         self.minimize_to_tray()
 
     def handle_floating_extract(self, clip_text: str):
-        self.input_edit.setPlainText(clip_text)
         if any(k in clip_text for k in ["y.qq.com", "music.163.com", "QQ音乐", "网易云"]):
             self.switch_mode("music_link")
         else:
             self.switch_mode("video_link")
-        self.start_extract()
+        self.input_edit.setPlainText(clip_text)
+        self.start_extract(download_only=False)
 
     def switch_mode(self, mode_key: str):
+        if self.current_mode in self.mode_configs:
+            old_cfg = self.mode_configs[self.current_mode]
+            old_cfg["input_text"] = self.input_edit.toPlainText()
+            old_cfg["meta"] = self.lbl_detail_meta.text()
+            old_cfg["source"] = self.detail_source.toPlainText()
+            old_cfg["content"] = self.detail_content.toPlainText()
+
         self.current_mode = mode_key
         for k, btn in self.nav_buttons.items():
             btn.setProperty("active", "true" if k == mode_key else "false")
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
-        titles = {
-            "video_link": ("链接转文字 & 无水印视频保存", "粘贴抖音 / 快手 / 小红书分享口令或网页链接..."),
-            "music_link": ("QQ音乐 & 网易云音乐嗅探下载（自动按歌名重命名）", "粘贴 QQ音乐 或 网易云音乐单曲分享链接..."),
-            "article_link": ("文章 / 公众号链接转文字", "粘贴微信公众号或网页文章链接..."),
-            "local_media": ("本地音视频批量转文字（支持多选文件队列）", "点击下方「立即提取」弹出多选文件框，一次性批量转写..."),
-            "local_image": ("图片 / 截图离线识字（支持多张批量识别）", "点击下方「立即提取」选择本地图片或截图..."),
-        }
-        t, ph = titles[mode_key]
-        self.lbl_mode_title.setText(t)
-        self.input_edit.setPlaceholderText(ph)
+        cfg = self.mode_configs[mode_key]
+        self.lbl_mode_title.setText(cfg["title"])
+        self.input_edit.setPlaceholderText(cfg["placeholder"])
+        self.input_edit.setPlainText(cfg["input_text"])
+        self.lbl_detail_meta.setText(cfg["meta"])
+        self.detail_source.setPlainText(cfg["source"])
+        self.detail_content.setPlainText(cfg["content"])
+
+        if cfg["media_path"]:
+            self.lbl_media_file.setVisible(True)
+            self.lbl_media_file.setText(f"✅ 本地媒体已保存并自动重命名：{cfg['media_path']}")
+        else:
+            self.lbl_media_file.setVisible(False)
+
+        if mode_key == "video_link":
+            self.input_edit.setVisible(True)
+            self.btn_run.setText("⚡ 提取文案 + 视频")
+            self.btn_download_only.setVisible(True)
+            self.btn_browser.setVisible(True)
+        elif mode_key == "music_link":
+            self.input_edit.setVisible(True)
+            self.btn_run.setText("🎵 嗅探并下载音乐")
+            self.btn_download_only.setVisible(False)
+            self.btn_browser.setVisible(True)
+        elif mode_key == "article_link":
+            self.input_edit.setVisible(True)
+            self.btn_run.setText("⚡ 立即提取文章")
+            self.btn_download_only.setVisible(False)
+            self.btn_browser.setVisible(False)
+        elif mode_key == "local_media":
+            self.input_edit.setVisible(False)
+            self.btn_run.setText("📂 选择本地音视频转文字")
+            self.btn_download_only.setVisible(False)
+            self.btn_browser.setVisible(False)
+        elif mode_key == "local_image":
+            self.input_edit.setVisible(False)
+            self.btn_run.setText("🖼️ 选择本地图片离线识字")
+            self.btn_download_only.setVisible(False)
+            self.btn_browser.setVisible(False)
+
+        self.refresh_history()
 
     def open_login_browser(self):
         url = "https://y.qq.com" if self.current_mode == "music_link" else "https://www.douyin.com"
-        QMessageBox.information(self, "小窗登录提示", "即将打开内置浏览器窗口。登录账号或完成滑块验证后，直接关闭浏览器窗口即可自动保存登录状态。")
-        self.sniffer.open_login_window(url)
+        self.show_embedded_browser()
+        self.worker = WorkerThread("login_embed", url, self.ai_engine, self.sniffer, host_info_fn=self.get_browser_host_info)
+        self.worker.show_browser_signal.connect(self.show_embedded_browser)
+        self.worker.hide_browser_signal.connect(self.hide_embedded_browser)
+        self.worker.start()
 
-    def start_extract(self):
+    def start_extract(self, download_only: bool = False):
         if self.current_mode in ["local_media", "local_image"]:
             filt = "音视频文件 (*.mp4 *.mov *.mkv *.avi *.mp3 *.wav *.m4a *.aac *.flac)" if self.current_mode == "local_media" else "图片文件 (*.png *.jpg *.jpeg *.bmp *.webp)"
             files, _ = QFileDialog.getOpenFileNames(self, "选择要批量提取的文件", "", filt)
             if not files:
                 return
-            payload = files
+            self._run_worker(self.current_mode, files)
         else:
             payload = self.input_edit.toPlainText().strip()
             if not payload:
                 QMessageBox.warning(self, "提示", "请先粘贴链接或分享口令！")
                 return
+            task = "video_download_only" if (self.current_mode == "video_link" and download_only) else self.current_mode
+            self._run_worker(task, payload)
 
+    def _run_worker(self, task_type: str, payload):
         self.btn_run.setEnabled(False)
+        self.btn_download_only.setEnabled(False)
+        self._saved_btn_text = self.btn_run.text()
         self.btn_run.setText("⏳ 正在处理中...")
 
-        self.worker = WorkerThread(self.current_mode, payload, self.ai_engine, self.sniffer)
+        self.worker = WorkerThread(task_type, payload, self.ai_engine, self.sniffer, host_info_fn=self.get_browser_host_info)
+        self.worker.show_browser_signal.connect(self.show_embedded_browser)
+        self.worker.hide_browser_signal.connect(self.hide_embedded_browser)
         self.worker.finished_signal.connect(self.on_extract_done)
         self.worker.error_signal.connect(self.on_extract_error)
         self.worker.start()
 
     def on_extract_done(self, res: dict):
         self.btn_run.setEnabled(True)
-        self.btn_run.setText("⚡ 立即提取")
+        self.btn_download_only.setEnabled(True)
+        self.btn_run.setText(getattr(self, "_saved_btn_text", "⚡ 立即提取"))
+        self.hide_embedded_browser()
+
         self.db.add_record(res["category"], res["source"], res["content"], res.get("media_path", ""))
         self.refresh_history()
         if self.history_list.count() > 0:
@@ -522,18 +742,17 @@ class MainWindow(QMainWindow):
 
     def on_extract_error(self, err_msg: str):
         self.btn_run.setEnabled(True)
-        self.btn_run.setText("⚡ 立即提取")
+        self.btn_download_only.setEnabled(True)
+        self.btn_run.setText(getattr(self, "_saved_btn_text", "⚡ 立即提取"))
+        self.hide_embedded_browser()
         QMessageBox.critical(self, "提取失败", f"处理过程中出现问题：\n{err_msg}")
-
-    def set_filter(self, cat: str):
-        self.current_filter = cat
-        self.refresh_history()
 
     def refresh_history(self):
         self.history_list.clear()
-        records = self.db.get_records(self.current_filter)
+        cat = self.mode_configs[self.current_mode]["category"]
+        records = self.db.get_records(cat)
         for r in records:
-            preview = r["content"].replace("\n", " ")[:42]
+            preview = r["content"].replace("\n", " ")[:40]
             item = QListWidgetItem(f"[{r['category']}]  {r['extract_time']}\n{preview}...")
             item.setData(Qt.ItemDataRole.UserRole, r)
             self.history_list.addItem(item)
@@ -542,15 +761,22 @@ class MainWindow(QMainWindow):
         if not current:
             return
         r = current.data(Qt.ItemDataRole.UserRole)
-        self.current_record = r
-        self.lbl_detail_meta.setText(f"识别时间：{r['extract_time']}   |   分类：{r['category']}")
+        meta_str = f"识别时间：{r['extract_time']}   |   分类：{r['category']}"
+        self.lbl_detail_meta.setText(meta_str)
         self.detail_source.setPlainText(r["source_info"])
         self.detail_content.setPlainText(r["content"])
-        if r.get("media_path"):
+        mpath = r.get("media_path", "")
+        if mpath:
             self.lbl_media_file.setVisible(True)
-            self.lbl_media_file.setText(f"✅ 本地媒体已保存并自动重命名：{r['media_path']}")
+            self.lbl_media_file.setText(f"✅ 本地媒体已保存并自动重命名：{mpath}")
         else:
             self.lbl_media_file.setVisible(False)
+
+        cfg = self.mode_configs[self.current_mode]
+        cfg["meta"] = meta_str
+        cfg["source"] = r["source_info"]
+        cfg["content"] = r["content"]
+        cfg["media_path"] = mpath
 
     def copy_text(self, text: str):
         if text:
@@ -558,11 +784,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "已复制", "内容已复制到剪贴板！")
 
     def export_current(self, fmt: str):
-        records = self.db.get_records(self.current_filter)
+        cat = self.mode_configs[self.current_mode]["category"]
+        records = self.db.get_records(cat)
         if not records:
             return
         ext_map = {"txt": "文本文件 (*.txt)", "docx": "Word 文档 (*.docx)", "md": "Markdown 文档 (*.md)"}
-        fpath, _ = QFileDialog.getSaveFileName(self, "导出记录", f"文案提取导出.{fmt}", ext_map[fmt])
+        fpath, _ = QFileDialog.getSaveFileName(self, "导出记录", f"{cat}_提取导出.{fmt}", ext_map[fmt])
         if fpath:
             HistoryManager.export_records(records, fpath, fmt)
             QMessageBox.information(self, "导出成功", f"已成功导出 {len(records)} 条记录至：\n{fpath}")

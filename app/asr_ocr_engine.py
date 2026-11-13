@@ -59,7 +59,6 @@ class LocalAiEngine:
             if samples.ndim > 1:
                 samples = samples[:, 0]
 
-            # 20秒长音频自动切片，防止长段退化或吞字
             chunk_len = 20 * sample_rate
             total_len = len(samples)
             if total_len == 0:
@@ -98,7 +97,7 @@ class LocalAiEngine:
             return "未在输入中检测到有效网页链接"
         url = match.group(0)
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"
         }
         resp = requests.get(url, headers=headers, timeout=15)
         resp.encoding = resp.apparent_encoding
