@@ -73,38 +73,31 @@ def embed_chromium_into_widget(title_keyword: str, parent_hwnd: int, width: int,
 
 
 def _walk_json_for_clean_media(obj, candidates: list, titles: list):
-    """模拟油猴脚本深度递归扫描网页接口 JSON / Hydration 状态树，提取原始无水印 CDN 地址与真实标题"""
     if isinstance(obj, dict):
-        # 提取标题/文案描述
         for tk in ("desc", "title", "caption", "noteTitle"):
             val = obj.get(tk)
             if isinstance(val, str) and len(val.strip()) > 2 and not titles:
                 titles.append(val.strip())
 
-        # 1. 抖音/TikTok 风格结构: video.play_addr.url_list (注意跳过 download_addr，因为 download_addr 才是带平台水印的!)
         if "play_addr" in obj and isinstance(obj["play_addr"], dict):
             ulist = obj["play_addr"].get("url_list") or []
             for u in ulist:
                 if isinstance(u, str) and u.startswith("http"):
                     clean_u = u.replace("playwm", "play")
-                    # 优先把第三方/无水印直链排在最前
                     if "watermark=0" in clean_u or "playwm" not in u:
                         candidates.insert(0, clean_u)
                     else:
                         candidates.append(clean_u)
 
-        # 2. 小红书/通用结构: masterUrl / originVideoKey / h264 / h265 / backupUrls
         if "masterUrl" in obj and isinstance(obj["masterUrl"], str) and obj["masterUrl"].startswith("http"):
             candidates.insert(0, obj["masterUrl"])
 
-        # 3. 快手风格结构: photoUrl / mainMvUrls
         if "mainMvUrls" in obj and isinstance(obj["mainMvUrls"], list):
             for item in obj["mainMvUrls"]:
                 if isinstance(item, dict) and isinstance(item.get("url"), str):
                     candidates.insert(0, item["url"])
 
         for k, v in obj.items():
-            # 坚决跳过 download_addr（官方强制压印水印的下载地址）
             if k in ("download_addr", "downloadAddr", "wm_video_url"):
                 continue
             _walk_json_for_clean_media(v, candidates, titles)
@@ -175,7 +168,6 @@ class MediaSniffer:
             ctx = self._launch_desktop_context(p, width=w, height=h)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-            # 注入油猴同款页面 Hook：拦截页面 XHR/Fetch JSON 数据以及页面全局变量状态
             page.add_init_script('''
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 window.__CLEAN_MEDIA_JSONS__ = [];
@@ -199,7 +191,6 @@ class MediaSniffer:
                 try:
                     ct = response.headers.get("content-type", "").lower()
                     u = response.url
-                    # 1. 优先拦截接口 JSON 元数据（油猴核心原理：从接口数据拿原始无水印 play_addr）
                     if "application/json" in ct or "text/plain" in ct:
                         if any(k in u for k in ("aweme/detail", "aweme/post", "feed", "note", "graphql", "video")):
                             body_txt = response.text()
@@ -207,7 +198,6 @@ class MediaSniffer:
                                 data = json.loads(body_txt)
                                 _walk_json_for_clean_media(data, api_clean_urls, extracted_titles)
 
-                    # 2. 兜底记录真实播放媒体流（排除带水印下载接口）
                     if ("video/" in ct or ".mp4" in u or "aweme/v1/play" in u) and not u.endswith(".ts"):
                         if "watermark=1" in u or "download" in u:
                             return
@@ -224,7 +214,6 @@ class MediaSniffer:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
             for _ in range(90):
-                # 同步读取页面脚本内嵌的 SSR 状态（如 RENDER_DATA / __INITIAL_STATE__ / Hook 到的 JSON）
                 if not api_clean_urls and not page.is_closed():
                     try:
                         hooked = page.evaluate('''() => {
@@ -258,7 +247,6 @@ class MediaSniffer:
             if not page.is_closed():
                 page_title = page.title() or ""
 
-            # 优先选用从元数据接口解析出的纯净原始 play_addr，其次选用浏览器播放器真实加载的 <video> src
             final_candidates = api_clean_urls if api_clean_urls else stream_fallback_urls
             if not final_candidates:
                 ctx.close()
@@ -270,7 +258,6 @@ class MediaSniffer:
             clean_title = sanitize_filename(re.sub(r"[-_|].*?(抖音|快手|小红书).*", "", raw_title))
             save_path = unique_filepath(self.video_dir, clean_title, ".mp4")
 
-            # 携带当前浏览器上下文的 Cookie 和 Referer 下载，确保 CDN 放行最高清原画流
             cookies = ctx.cookies()
             cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             headers = {

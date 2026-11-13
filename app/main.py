@@ -1,6 +1,9 @@
 import os
 import sys
+import platform
+import traceback
 import subprocess
+from datetime import datetime
 
 os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 
@@ -9,15 +12,175 @@ from PyQt6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QPlainTextEdit, QListWidget, QListWidgetItem,
-    QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QStackedWidget
+    QFileDialog, QMessageBox, QFrame, QSystemTrayIcon, QMenu, QStackedWidget,
+    QDialog
 )
 
 from database import HistoryManager
 from asr_ocr_engine import LocalAiEngine
 from media_sniffer import MediaSniffer
 
+APP_VERSION = "v1.0.7"
+APP_TITLE = f"全能离线文案与媒体提取工作台 ({APP_VERSION})"
+
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".avi", ".flv", ".wmv", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+class ErrorReportDialog(QDialog):
+    def __init__(self, summary_msg: str, full_log: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"提取异常诊断 ({APP_VERSION})")
+        self.resize(560, 380)
+        self.full_log = full_log
+
+        self.setStyleSheet('''
+            QDialog { background-color: #FFFFFF; }
+            QLabel { font-family: "Microsoft YaHei"; color: #0F172A; }
+            QPlainTextEdit {
+                background-color: #F8FAFC; border: 1.5px solid #FECACA;
+                border-radius: 10px; padding: 10px; font-family: "Consolas", "Microsoft YaHei";
+                font-size: 12px; color: #7F1D1D;
+            }
+            QPushButton#ExportLogBtn {
+                background-color: #DC2626; color: #FFFFFF; border: none; border-radius: 9px;
+                padding: 9px 16px; font-size: 13px; font-weight: bold; font-family: "Microsoft YaHei";
+            }
+            QPushButton#ExportLogBtn:hover { background-color: #B91C1C; }
+            QPushButton#SecondaryBtn {
+                background-color: #F1F5F9; color: #1E293B; border: 1px solid #CBD5E1;
+                border-radius: 9px; padding: 9px 14px; font-size: 12px; font-weight: bold; font-family: "Microsoft YaHei";
+            }
+            QPushButton#SecondaryBtn:hover { background-color: #E2E8F0; }
+        ''')
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        hdr = QLabel(f"❌ 处理过程中出现问题（当前版本：{APP_VERSION}）")
+        hdr.setStyleSheet("font-size: 15px; font-weight: bold; color: #DC2626;")
+        layout.addWidget(hdr)
+
+        lbl_sum = QLabel(summary_msg)
+        lbl_sum.setWordWrap(True)
+        lbl_sum.setStyleSheet("font-size: 13px; color: #334155;")
+        layout.addWidget(lbl_sum)
+
+        lbl_detail = QLabel("详细错误堆栈与环境日志（可导出发给开发者快速定位）：")
+        lbl_detail.setStyleSheet("font-size: 12px; font-weight: bold; color: #475569;")
+        layout.addWidget(lbl_detail)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setPlainText(full_log)
+        layout.addWidget(self.log_view)
+
+        btn_row = QHBoxLayout()
+        btn_export = QPushButton("📥 导出错误日志 (.log / .txt)")
+        btn_export.setObjectName("ExportLogBtn")
+        btn_export.clicked.connect(self.export_log_file)
+
+        btn_copy = QPushButton("📋 复制日志")
+        btn_copy.setObjectName("SecondaryBtn")
+        btn_copy.clicked.connect(self.copy_log)
+
+        btn_close = QPushButton("关闭")
+        btn_close.setObjectName("SecondaryBtn")
+        btn_close.clicked.connect(self.accept)
+
+        btn_row.addWidget(btn_export)
+        btn_row.addWidget(btn_copy)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        layout.addLayout(btn_row)
+
+    def copy_log(self):
+        QApplication.clipboard().setText(self.full_log)
+        QMessageBox.information(self, "已复制", "完整错误日志已复制到剪贴板！")
+
+    def export_log_file(self):
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"错误诊断日志_{APP_VERSION}_{ts}.log"
+        fpath, _ = QFileDialog.getSaveFileName(
+            self, "导出错误诊断日志", default_name, "日志文件 (*.log);;文本文件 (*.txt)"
+        )
+        if fpath:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(self.full_log)
+            QMessageBox.information(self, "导出成功", f"错误日志已保存至：\n{fpath}")
+
+
+class CloseConfirmDialog(QDialog):
+    """首次关闭主窗口时弹出的是否完全关闭还是最小化到托盘选择对话框"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"关闭提示 ({APP_VERSION})")
+        self.setFixedSize(410, 195)
+        self.choice = "cancel"
+
+        self.setStyleSheet('''
+            QDialog { background-color: #FFFFFF; }
+            QLabel { font-family: "Microsoft YaHei"; color: #0F172A; }
+            QPushButton#MinimizeBtn {
+                background-color: #1677FF; color: #FFFFFF; border: none; border-radius: 9px;
+                padding: 9px 14px; font-size: 13px; font-weight: bold; font-family: "Microsoft YaHei";
+            }
+            QPushButton#MinimizeBtn:hover { background-color: #0958D9; }
+            QPushButton#QuitBtn {
+                background-color: #FEF2F2; color: #DC2626; border: 1px solid #FECACA; border-radius: 9px;
+                padding: 9px 14px; font-size: 13px; font-weight: bold; font-family: "Microsoft YaHei";
+            }
+            QPushButton#QuitBtn:hover { background-color: #FEE2E2; }
+            QPushButton#CancelBtn {
+                background-color: #F1F5F9; color: #475569; border: none; border-radius: 9px;
+                padding: 9px 12px; font-size: 12px; font-weight: bold; font-family: "Microsoft YaHei";
+            }
+            QPushButton#CancelBtn:hover { background-color: #E2E8F0; }
+        ''')
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
+
+        lbl_title = QLabel("您点击了关闭主窗口，请选择操作方式：")
+        lbl_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #0F172A;")
+        layout.addWidget(lbl_title)
+
+        lbl_desc = QLabel("• 最小化到托盘：程序在后台继续运行（本次运行后续再点关闭将直接最小化，不再重复询问）。\n• 完全关闭软件：彻底退出所有进程。")
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setStyleSheet("font-size: 12px; color: #475569; line-height: 1.4;")
+        layout.addWidget(lbl_desc)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_min = QPushButton("🔽 最小化到托盘")
+        btn_min.setObjectName("MinimizeBtn")
+        btn_min.clicked.connect(self._choose_minimize)
+
+        btn_quit = QPushButton("⏻ 完全关闭软件")
+        btn_quit.setObjectName("QuitBtn")
+        btn_quit.clicked.connect(self._choose_quit)
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("CancelBtn")
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_row.addWidget(btn_min, 3)
+        btn_row.addWidget(btn_quit, 3)
+        btn_row.addWidget(btn_cancel, 1)
+        layout.addLayout(btn_row)
+
+    def _choose_minimize(self):
+        self.choice = "minimize"
+        self.accept()
+
+    def _choose_quit(self):
+        self.choice = "quit"
+        self.accept()
 
 
 class PlainTextInput(QPlainTextEdit):
@@ -30,7 +193,7 @@ class PlainTextInput(QPlainTextEdit):
 
 class WorkerThread(QThread):
     finished_signal = pyqtSignal(dict)
-    error_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str, str)
     show_browser_signal = pyqtSignal()
     hide_browser_signal = pyqtSignal()
 
@@ -135,12 +298,28 @@ class WorkerThread(QThread):
                 )
         except Exception as e:
             self.hide_browser_signal.emit()
-            self.error_signal.emit(str(e))
+            tb = traceback.format_exc()
+            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            diag_report = (
+                f"================ 软件异常诊断日志 ================\n"
+                f"软件版本：{APP_VERSION}\n"
+                f"发生时间：{now_ts}\n"
+                f"执行任务：{self.task_type}\n"
+                f"输入参数：{str(self.payload)[:300]}\n"
+                f"操作系统：{platform.platform()} ({platform.machine()})\n"
+                f"工作目录：{os.getcwd()}\n"
+                f"错误摘要：{str(e)}\n"
+                f"---------------- 详细堆栈追踪 ----------------\n"
+                f"{tb}"
+            )
+            self.error_signal.emit(str(e), diag_report)
 
 
 class FloatingCapsule(QWidget):
+    """持续置顶悬浮窗：开启后无论主窗口是显示、切换功能、最小化还是托盘状态，始终持续显示，直到主动关闭悬浮窗"""
     restore_requested = pyqtSignal()
     quick_extract_requested = pyqtSignal(str)
+    closed_by_user = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -171,20 +350,31 @@ class FloatingCapsule(QWidget):
         ''')
         c_layout = QHBoxLayout(container)
         c_layout.setContentsMargins(12, 6, 10, 6)
-        c_layout.setSpacing(8)
+        c_layout.setSpacing(6)
 
-        lbl = QLabel("● 悬浮提取")
+        lbl = QLabel(f"● 悬浮提取 {APP_VERSION}")
         btn_clip = QPushButton("⚡ 粘链提取")
         btn_clip.clicked.connect(self._on_clip_click)
 
-        btn_expand = QPushButton("↗")
+        btn_expand = QPushButton("主界面")
         btn_expand.setStyleSheet("background-color: #334155; color: #FFFFFF; padding: 5px 8px;")
+        btn_expand.setToolTip("唤出主工作台（悬浮窗仍保持显示）")
         btn_expand.clicked.connect(self.restore_requested.emit)
+
+        btn_hide_float = QPushButton("✕")
+        btn_hide_float.setStyleSheet("background-color: #475569; color: #FFFFFF; padding: 5px 7px;")
+        btn_hide_float.setToolTip("关闭悬浮窗")
+        btn_hide_float.clicked.connect(self._on_close_float)
 
         c_layout.addWidget(lbl)
         c_layout.addWidget(btn_clip)
         c_layout.addWidget(btn_expand)
+        c_layout.addWidget(btn_hide_float)
         layout.addWidget(container)
+
+    def _on_close_float(self):
+        self.hide()
+        self.closed_by_user.emit()
 
     def _on_clip_click(self):
         clip_text = QApplication.clipboard().text().strip()
@@ -208,7 +398,7 @@ class FloatingCapsule(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("全能离线文案与媒体提取工作台（即开即用完整版）")
+        self.setWindowTitle(APP_TITLE)
         self.resize(1240, 760)
         self.setAcceptDrops(True)
 
@@ -217,6 +407,11 @@ class MainWindow(QMainWindow):
         self.sniffer = MediaSniffer("Downloads", "browser_profile")
         self.current_mode = "video_link"
         self.is_pinned = False
+
+        # 悬浮窗持续开启状态标记（一旦开启，无论主窗口如何操作都持续显示，直到主动关闭）
+        self.floating_enabled = False
+        # 本次软件启动后的“首次关闭主界面提示”标记（每次全新启动程序重置为 False）
+        self.has_prompted_close_this_session = False
 
         self.mode_configs = {
             "video_link": {
@@ -272,8 +467,9 @@ class MainWindow(QMainWindow):
         }
 
         self.floating_win = FloatingCapsule()
-        self.floating_win.restore_requested.connect(self.restore_from_floating)
+        self.floating_win.restore_requested.connect(self.bring_main_to_front)
         self.floating_win.quick_extract_requested.connect(self.handle_floating_extract)
+        self.floating_win.closed_by_user.connect(self._on_floating_closed)
 
         self._init_tray()
         self._init_ui()
@@ -297,12 +493,12 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(self._create_app_icon())
         self.tray = QSystemTrayIcon(self._create_app_icon(), self)
         tray_menu = QMenu()
-        act_show = QAction("显示主工作台", self)
-        act_show.triggered.connect(self.restore_from_tray)
-        act_float = QAction("切换桌面悬浮窗", self)
-        act_float.triggered.connect(self.switch_to_floating)
+        act_show = QAction(f"显示主工作台 ({APP_VERSION})", self)
+        act_show.triggered.connect(self.bring_main_to_front)
+        act_float = QAction("开启 / 切换桌面悬浮窗", self)
+        act_float.triggered.connect(self.toggle_floating_window)
         act_quit = QAction("彻底退出程序", self)
-        act_quit.triggered.connect(QApplication.instance().quit)
+        act_quit.triggered.connect(self.quit_application_completely)
 
         tray_menu.addAction(act_show)
         tray_menu.addAction(act_float)
@@ -314,7 +510,7 @@ class MainWindow(QMainWindow):
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self.restore_from_tray()
+            self.bring_main_to_front()
 
     def _init_ui(self):
         self.setStyleSheet('''
@@ -362,7 +558,7 @@ class MainWindow(QMainWindow):
         top_layout = QHBoxLayout(top_bar)
         top_layout.setContentsMargins(18, 10, 18, 10)
 
-        lbl_brand = QLabel("全能离线文案与媒体提取工作台")
+        lbl_brand = QLabel(APP_TITLE)
         lbl_brand.setStyleSheet("font-size: 15px; font-weight: bold; color: #0F172A;")
         lbl_badge = QLabel(" 元数据直链无水印嗅探 · 任意界面拖入文件 · 独立工作区 ")
         lbl_badge.setStyleSheet("background-color: #E0F2FE; color: #0284C7; border-radius: 8px; padding: 3px 8px; font-size: 11px; font-weight: bold;")
@@ -371,9 +567,9 @@ class MainWindow(QMainWindow):
         self.btn_pin.setObjectName("SecondaryBtn")
         self.btn_pin.clicked.connect(self.toggle_pin)
 
-        btn_float = QPushButton("🎯 悬浮窗")
-        btn_float.setObjectName("SecondaryBtn")
-        btn_float.clicked.connect(self.switch_to_floating)
+        self.btn_float = QPushButton("🎯 开启悬浮窗")
+        self.btn_float.setObjectName("SecondaryBtn")
+        self.btn_float.clicked.connect(self.toggle_floating_window)
 
         btn_tray = QPushButton("🔽 最小化托盘")
         btn_tray.setObjectName("SecondaryBtn")
@@ -383,13 +579,17 @@ class MainWindow(QMainWindow):
         btn_dir.setObjectName("SecondaryBtn")
         btn_dir.clicked.connect(self.open_download_folder)
 
+        lbl_top_ver = QLabel(f" {APP_VERSION} ")
+        lbl_top_ver.setStyleSheet("background-color: #1677FF; color: #FFFFFF; border-radius: 8px; padding: 5px 10px; font-size: 12px; font-weight: bold;")
+
         top_layout.addWidget(lbl_brand)
         top_layout.addWidget(lbl_badge)
         top_layout.addStretch()
         top_layout.addWidget(self.btn_pin)
-        top_layout.addWidget(btn_float)
+        top_layout.addWidget(self.btn_float)
         top_layout.addWidget(btn_tray)
         top_layout.addWidget(btn_dir)
+        top_layout.addWidget(lbl_top_ver)
         root_layout.addWidget(top_bar)
 
         body_layout = QHBoxLayout()
@@ -420,7 +620,7 @@ class MainWindow(QMainWindow):
             self.nav_buttons[key] = btn
 
         side_layout.addStretch()
-        lbl_tip = QLabel("💡 效率提示：\n将音视频或图片拖入软件任意位置，会自动跳转到对应功能并立即开始提取！")
+        lbl_tip = QLabel(f"💡 效率提示（{APP_VERSION}）：\n将音视频或图片拖入软件任意位置，会自动跳转到对应功能并立即开始提取！")
         lbl_tip.setWordWrap(True)
         lbl_tip.setStyleSheet("background-color: #F0F9FF; border: 1px solid #BAE6FD; border-radius: 10px; padding: 10px; font-size: 11px; color: #0369A1;")
         side_layout.addWidget(lbl_tip)
@@ -605,29 +805,65 @@ class MainWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.is_pinned)
         self.show()
         self.btn_pin.setText("📌 已置顶" if self.is_pinned else "📌 置顶窗口")
+        self._ensure_floating_persistent()
 
-    def switch_to_floating(self):
-        self.hide()
-        self.floating_win.show()
+    # ---------------- 悬浮窗持续显示控制（开启后任何状态下持续显示） ----------------
+    def _ensure_floating_persistent(self):
+        if self.floating_enabled:
+            self.floating_win.show()
+            self.floating_win.raise_()
 
-    def restore_from_floating(self):
-        self.floating_win.hide()
+    def toggle_floating_window(self):
+        self.floating_enabled = not self.floating_enabled
+        if self.floating_enabled:
+            self.floating_win.show()
+            self.floating_win.raise_()
+            self.btn_float.setText("🎯 悬浮窗已开启")
+            self.btn_float.setStyleSheet("background-color: #E6F4FF; color: #0958D9; border: 1px solid #91CAFF; border-radius: 9px; padding: 8px 12px; font-size: 12px; font-weight: bold;")
+        else:
+            self.floating_win.hide()
+            self.btn_float.setText("🎯 开启悬浮窗")
+            self.btn_float.setStyleSheet("")
+
+    def _on_floating_closed(self):
+        self.floating_enabled = False
+        self.btn_float.setText("🎯 开启悬浮窗")
+        self.btn_float.setStyleSheet("")
+
+    def bring_main_to_front(self):
+        # 唤出主窗口时，如果悬浮窗处于开启状态，绝不隐藏悬浮窗，继续保持置顶显示
         self.showNormal()
         self.activateWindow()
+        self.raise_()
+        self._ensure_floating_persistent()
 
     def minimize_to_tray(self):
+        # 最小化到托盘时，如果悬浮窗处于开启状态，依然保持悬浮窗持续显示
         self.hide()
-        self.floating_win.hide()
-        self.tray.showMessage("全能提取工作台", "程序已最小化到系统托盘，双击图标可随时恢复。", QSystemTrayIcon.MessageIcon.Information, 2000)
+        self._ensure_floating_persistent()
+        self.tray.showMessage(f"全能提取工作台 {APP_VERSION}", "主窗口已最小化到系统托盘，双击托盘图标可随时恢复。", QSystemTrayIcon.MessageIcon.Information, 2000)
 
-    def restore_from_tray(self):
+    def quit_application_completely(self):
+        # 完全关闭软件并彻底退出进程（下次再打开时 has_prompted_close_this_session 自动重置为 False）
         self.floating_win.hide()
-        self.showNormal()
-        self.activateWindow()
+        self.tray.hide()
+        QApplication.instance().quit()
 
     def closeEvent(self, event):
-        event.ignore()
-        self.minimize_to_tray()
+        # 每次启动后，第一次点击关闭主界面弹出询问框；选择最小化后第二次再点关闭直接最小化不再重复弹窗；
+        # 若选择完全关闭软件，下次重新启动软件后的第一次关闭会再次弹出询问框，形成闭环循环。
+        if not self.has_prompted_close_this_session:
+            event.ignore()
+            dlg = CloseConfirmDialog(self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                if dlg.choice == "quit":
+                    self.quit_application_completely()
+                elif dlg.choice == "minimize":
+                    self.has_prompted_close_this_session = True
+                    self.minimize_to_tray()
+        else:
+            event.ignore()
+            self.minimize_to_tray()
 
     def handle_floating_extract(self, clip_text: str):
         if any(k in clip_text for k in ["y.qq.com", "music.163.com", "QQ音乐", "网易云"]):
@@ -636,6 +872,7 @@ class MainWindow(QMainWindow):
             self.switch_mode("video_link")
         self.input_edit.setPlainText(clip_text)
         self.start_extract(download_only=False)
+        self._ensure_floating_persistent()
 
     def switch_mode(self, mode_key: str):
         if self.current_mode in self.mode_configs:
@@ -692,6 +929,7 @@ class MainWindow(QMainWindow):
             self.btn_browser.setVisible(False)
 
         self.refresh_history()
+        self._ensure_floating_persistent()
 
     def open_login_browser(self):
         url = "https://y.qq.com" if self.current_mode == "music_link" else "https://www.douyin.com"
@@ -699,7 +937,9 @@ class MainWindow(QMainWindow):
         self.worker = WorkerThread("login_embed", url, self.ai_engine, self.sniffer, host_info_fn=self.get_browser_host_info)
         self.worker.show_browser_signal.connect(self.show_embedded_browser)
         self.worker.hide_browser_signal.connect(self.hide_embedded_browser)
+        self.worker.error_signal.connect(self.on_extract_error)
         self.worker.start()
+        self._ensure_floating_persistent()
 
     def start_extract(self, download_only: bool = False):
         if self.current_mode in ["local_media", "local_image"]:
@@ -728,6 +968,7 @@ class MainWindow(QMainWindow):
         self.worker.finished_signal.connect(self.on_extract_done)
         self.worker.error_signal.connect(self.on_extract_error)
         self.worker.start()
+        self._ensure_floating_persistent()
 
     def on_extract_done(self, res: dict):
         self.btn_run.setEnabled(True)
@@ -739,13 +980,17 @@ class MainWindow(QMainWindow):
         self.refresh_history()
         if self.history_list.count() > 0:
             self.history_list.setCurrentRow(0)
+        self._ensure_floating_persistent()
 
-    def on_extract_error(self, err_msg: str):
+    def on_extract_error(self, err_msg: str, full_log: str):
         self.btn_run.setEnabled(True)
         self.btn_download_only.setEnabled(True)
         self.btn_run.setText(getattr(self, "_saved_btn_text", "⚡ 立即提取"))
         self.hide_embedded_browser()
-        QMessageBox.critical(self, "提取失败", f"处理过程中出现问题：\n{err_msg}")
+
+        dlg = ErrorReportDialog(err_msg, full_log, self)
+        dlg.exec()
+        self._ensure_floating_persistent()
 
     def refresh_history(self):
         self.history_list.clear()
