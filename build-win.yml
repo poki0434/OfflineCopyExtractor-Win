@@ -1,0 +1,70 @@
+name: Build Windows Full Portable Package
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: 1. 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 2. 自动识别并解压全量源码压缩包（支持直接上传压缩包覆盖）
+        run: |
+          if (Test-Path "OfflineCopyExtractor-Win-Source.zip") {
+            powershell Expand-Archive -Path "OfflineCopyExtractor-Win-Source.zip" -DestinationPath "." -Force
+          }
+
+      - name: 3. 配置 Python 3.10 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 4. 安装核心依赖与完整可见小窗浏览器内核
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: 0
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+
+      - name: 5. 预下载并精简 SenseVoice 离线语音模型（仅保留 int8 加速版，极速省空间）
+        run: |
+          New-Item -ItemType Directory -Force -Path "models"
+          curl.exe -L -o models/sensevoice.tar.bz2 https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+          tar -xjf models/sensevoice.tar.bz2 -C models/
+          Move-Item -Path "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/model.int8.onnx", "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/tokens.txt" -Destination "models/" -Force
+          Remove-Item -Path "models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17", "models/sensevoice.tar.bz2" -Recurse -Force
+
+      - name: 6. 打包即开即用绿色版目录
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: 0
+        run: |
+          pyinstaller --noconfirm --onedir --windowed `
+            --name "文案与媒体全能提取工作台" `
+            --add-data "models;models" `
+            --collect-all rapidocr_onnxruntime `
+            --collect-all imageio_ffmpeg `
+            --collect-all sherpa_onnx `
+            --collect-all playwright `
+            app/main.py
+
+      - name: 7. 高压缩封包
+        run: |
+          New-Item -ItemType Directory -Force -Path "release_pkg"
+          Copy-Item -Path "dist\文案与媒体全能提取工作台" -Destination "release_pkg\文案与媒体全能提取工作台" -Recurse -Force
+          Compress-Archive -Path "release_pkg\文案与媒体全能提取工作台" -DestinationPath "OfflineCopyExtractor-Win-Portable.zip" -CompressionLevel Optimal -Force
+
+      - name: 8. 发布到 Releases（支持多线程满速下载）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.3-${{ github.run_number }}
+          name: Windows 绿色免安装完整版 (Build #${{ github.run_number }})
+          files: OfflineCopyExtractor-Win-Portable.zip
